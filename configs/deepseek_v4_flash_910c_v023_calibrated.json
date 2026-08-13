@@ -1,0 +1,74 @@
+{
+  "schema_version": 2,
+  "operation": "recommend",
+  "platform": {
+    "device": "910c",
+    "vllm_ascend_version": "0.23.0rc1",
+    "hbm_gib_per_die": 64.0,
+    "nominal_hbm_gib_per_die": 64.0,
+    "visible_hbm_gib_per_die": 61.27,
+    "startup_free_hbm_gib_per_die": 60.89,
+    "gpu_memory_utilization": 0.9
+  },
+  "vllm_ascend": {
+    "enable_shared_expert_dp": true,
+    "multistream_overlap_shared_expert": true,
+    "enable_flashcomm1": true,
+    "hccl_buffsize_mib": 1024,
+    "hccl_communication_domains_per_rank": 1
+  },
+  "model": {
+    "profile": "deepseek-v4-flash"
+  },
+  "scheduler": {
+    "block_size": 128,
+    "max_model_len": 524288,
+    "max_num_batched_tokens": 45056,
+    "max_num_seqs": 64
+  },
+  "parallelism": {
+    "dp_size": 8,
+    "tp_size": 2,
+    "pp_size": 1,
+    "ep_size": 16,
+    "pcp_size": 1,
+    "dcp_size": 1
+  },
+  "runtime": {
+    "base_persistent_gib_per_rank": 1.08
+  },
+  "recommendation": {
+    "objective": "balanced",
+    "candidate_max_num_batched_tokens": [
+      1024,
+      2048,
+      4096,
+      8192,
+      10240,
+      16384,
+      24576,
+      32768,
+      40960,
+      45056,
+      47104,
+      65536,
+      81920,
+      98304
+    ],
+    "candidate_max_num_seqs": [1, 2, 4, 8, 16, 32, 64],
+    "scenarios": [
+      {"name": "524k_long_context", "context_len": 524288},
+      {"name": "131k_context", "context_len": 131072},
+      {"name": "32k_context", "context_len": 32768}
+    ],
+    "fit_basis": "planning_upper",
+    "minimum_headroom_gib_per_rank": 1.0,
+    "unresolved_workspace_reserve_gib_per_rank": 2.0,
+    "balanced_q_weight": 0.5,
+    "balanced_seq_weight": 0.5,
+    "top_k": 5
+  },
+  "output": {
+    "format": "text"
+  }
+}

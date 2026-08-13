@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-ascend-hbm-planner"
+version = "0.3.1"
+description = "Explainable HBM estimator and vLLM Ascend scheduler recommender"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [{name = "HBM Capacity Modeling Team"}]
+dependencies = []
+
+[project.scripts]
+vllm-ascend-hbm = "vllm_ascend_hbm.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

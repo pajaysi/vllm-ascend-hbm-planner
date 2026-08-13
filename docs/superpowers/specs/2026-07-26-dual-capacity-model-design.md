@@ -1,435 +1,527 @@
-# vLLM Ascend 双口径 HBM 容量模型设计
+# vLLM Ascend 双口径 HBM 容量模型设计（理论优先版）
 
 日期：2026-07-26  
 目标版本：vLLM Ascend HBM Planner v0.3  
 首个精确适配对象：DeepSeek-V4-Flash W8A8 + MTP、910C/A3、vLLM Ascend 0.23.0rc1
 
-## 1. 背景
+## 1. 设计原则
 
-现有工具把权重、运行时激活、KV BlockPool、图缓存和运行时开销累加成单个峰值，再据此推荐
-`max_num_batched_tokens`（下文记为 Q）和 `max_num_seqs`（下文记为 S）。
+工具采用“理论模型为主、实测日志为验证和残差诊断”的方法，不用经验拟合替代理论公式。
 
-实测表明这种口径混合了不同生命周期的内存：
+优先级如下：
 
-1. `profile_run` 使用 Q 个 dummy token 测量非 KV 峰值；
-2. vLLM 根据 profile 结果计算可用于 KV cache 的内存；
-3. KV planner 检查是否至少能容纳一个 `max_model_len` 请求；
-4. KV BlockPool 分配完成后，再进行 Decode 图捕获；
-5. 服务启动成功并不代表真实请求运行时一定安全。
+1. 直接复现指定 vLLM/vLLM Ascend 版本的源码计算；
+2. 根据 checkpoint 张量、量化格式和模块并行规则计算；
+3. 根据模型结构参数进行解析计算；
+4. 对 CANN/HCCL、算子 workspace、图缓存等难以完全静态确定的部分使用版本化实测值；
+5. 日志校准只能覆盖明确的未知项，不能覆盖已经可以理论计算的组件。
 
-因此工具必须区分：
+每项输出必须标明来源：
 
-- **启动极限**：只判断 `vllm serve` 能否完成初始化；
-- **运行安全值**：考虑真实请求、并发、上下文分布和安全余量后的推荐值。
+- `source_exact`：逐行等价于指定版本源码；
+- `tensor_exact`：来自 checkpoint header、dtype、shape 和确定的切分规则；
+- `architecture_analytical`：来自模型结构公式；
+- `measured`：来自启动日志或专项测量；
+- `residual`：理论值与实测值的未解释差额。
 
-## 2. 实测依据
+## 2. 双口径输出
 
-已确认平台输入：
+工具同时输出两个推荐结果：
+
+### 2.1 启动极限
+
+回答：
+
+> 给定配置下，`vllm serve` 能否完成 profile、KV 规划和图捕获？
+
+该口径用于复现实测表中的 `max_success_mnbt` 和 `first_fail_mnbt`。
+
+### 2.2 运行安全值
+
+回答：
+
+> 服务启动后，在指定请求长度、并发和 Prefill/Decode 场景下是否仍有足够物理 HBM？
+
+运行安全值不得高于启动极限。当前九组数据只验证启动极限，不能单独证明运行安全值。
+
+## 3. 已确认的实测依据
+
+平台与配置：
 
 - 逻辑 Die 名义 HBM：64 GiB；
-- vLLM 实际识别的设备总 HBM：61.27 GiB；
-- 启动时可用 HBM：60.89 GiB；
+- vLLM 可见总 HBM：61.27 GiB；
+- Worker 启动时空闲 HBM：60.89 GiB；
 - `gpu_memory_utilization=0.9`；
 - vLLM Ascend 0.23.0rc1；
 - DeepSeek-V4-Flash W8A8 + 1 层 MTP；
 - `block_size=128`、`max_num_seqs=64`；
-- `FULL_DECODE_ONLY`、异步调度、EP、FlashComm1、共享专家 DP。
+- EP、FlashComm1、shared expert DP、异步调度；
+- `FULL_DECODE_ONLY`。
 
-对于 `max_model_len=32768`、DP8/TP2：
+DP8/TP2、`max_model_len=32768` 的日志：
 
 | Q | 结果 | 关键证据 |
 |---:|---|---|
-| 45056 | 成功 | 权重 27.17 GiB，激活 7.27 GiB，non-Torch 3.08 GiB，Graph 1.97 GiB，实际 KV pool 17.63 GiB |
-| 47104 | 失败 | 最低 KV 需求 17.26 GiB，可用 KV 17.20 GiB，缺口 0.06 GiB |
+| 45056 | 成功 | 权重 27.17 GiB，激活 7.27 GiB，non-Torch 3.08 GiB，Graph 1.97 GiB，KV pool 17.63 GiB |
+| 47104 | 失败 | 最低 KV 需求 17.26 GiB，可用 KV 17.20 GiB，估算最大长度 32648 |
 
-成功点在最低 KV 检查前满足：
+可用 KV 的日志口径为：
 
 \[
-61.27 \times 0.9 - 27.17 - 7.27 - 3.08
-\approx 17.62\ \text{GiB}
+M_{\text{available-KV}}
+=M_{\text{visible-HBM}}\times U
+-M_{\text{model-load}}
+-M_{\text{profile-activation}}
+-M_{\text{non-Torch}}
 \]
 
-这与实际 KV pool 17.63 GiB 一致。失败发生在最低 KV 容量检查阶段，不是 Graph 捕获阶段。
+代入成功日志：
 
-现有模型在同一成功点存在误差抵消：
+\[
+61.27\times0.9-27.17-7.27-3.08
+\approx17.62\ \text{GiB}
+\]
 
-- 权重估算约 19.95 GiB，比实测少约 7.22 GiB；
-- KV planner 估算约 24.11 GiB，比实测最低需求多约 6.85 GiB；
-- 激活估算约 7.20 GiB，与实测 7.27 GiB 接近；
-- runtime/non-Torch 估算约 0.28 GiB，比实测少约 2.80 GiB。
+与实际 KV pool 17.63 GiB 一致。Graph 在该次 KV 预算之后分配，不参与这条最低 KV 检查公式。
 
-## 3. 目标与非目标
+## 4. KV Planner：必须源码等价，不做经验校准
 
-### 3.1 目标
+### 4.1 v0.23.0rc1 的页面布局
 
-1. 同时输出启动极限和运行安全推荐；
-2. 对每个结论给出内存分解、限制阶段、余量和可信度；
-3. 支持无日志时的解析估算，也支持用启动日志校准；
-4. 将模型、平台和 vLLM Ascend 版本差异封装为适配器；
-5. 将实测成功/失败边界作为区间验证，而不是伪造精确临界点；
-6. 保持现有 JSON 配置兼容，并提供明确的 schema 迁移。
+当 `block_size=128`：
 
-### 3.2 非目标
+| 缓存类型 | 内部 block | page bytes |
+|---|---:|---:|
+| C4/C128 MLA、SWA、C128 state、MTP | 128/32 | 131072 |
+| C4 indexer、C4 index state | 128/8 | 16640 |
 
-1. 不使用这 9 组仅启动数据证明真实请求运行安全；
-2. 不把全部实测点拟合后再将同一批数据报告为独立验证；
-3. 不承诺仅凭名义 HBM、模型名称和并行度精确还原 CANN/HCCL Workspace；
-4. 不在本阶段扩展新的模型家族，已有通用模型适配器只做兼容性保护。
+标准 layer tuple：
 
-## 4. 方案选择
+\[
+S_{\text{tuple}}=131072+16640=147712\ \text{bytes}
+\]
 
-采用**解析结构 + 版本化实测校准**的混合方案。
+DeepSeek-V4-Flash 的**最低 KV 准入检查**使用 22 个 layer tuple。物理
+KV pool 的创建路径会把 MTP 作为独立的大页面 tensor，并可能使用 23 个
+allocation tuple。两条源码路径的 tuple 口径不同，不能共用一个常量。
 
-- 解析模型负责生命周期、并行切分、KV 布局和候选搜索；
-- 日志校准负责实际权重、profile 激活、non-Torch、Graph 和可见 HBM；
-- 无实测项使用解析值，并增大不确定性；
-- 纯数据回归只用于诊断残差，不直接替代组件模型。
+### 4.2 最低 KV 需求公式
 
-## 5. 总体架构
+令：
 
-新增四个职责明确的子系统：
+- \(L\)：`max_model_len`；
+- \(Q\)：`max_num_batched_tokens`；
+- \(B=128\)；
+- SWA window \(W=128\)。
+
+各 group 的最大 page 数：
+
+\[
+P_{\text{C4-history}}
+=\left\lceil\frac{L}{4B}\right\rceil
+\]
+
+\[
+P_{\text{C128-history}}
+=\left\lceil\frac{L}{128B}\right\rceil
+\]
+
+\[
+P_{\text{SWA-one-group}}
+=\left\lceil
+\frac{\min(W-1+Q,L)}{B}
+\right\rceil+1
+\]
+
+DSV4 有两个 SWA group：
+
+\[
+P_{\text{SWA-total}}=2P_{\text{SWA-one-group}}
+\]
+
+\[
+P_{\text{C4-state}}
+=\left\lceil
+\frac{\min(7+Q,L)}{8}
+\right\rceil+1
+\]
+
+\[
+P_{\text{C128-state}}
+=\left\lceil
+\frac{\min(127+Q,L)}{32}
+\right\rceil+1
+\]
+
+C4 主 compressor state 与 C4 indexer compressor state 属于同一 block-size group，组容量取两者最大值，不相加。
+
+最低 KV 需求：
+
+\[
+M_{\text{required-min-KV}}
+=22\times147712\times
+\left(
+P_{\text{C4-history}}
++P_{\text{C128-history}}
++P_{\text{SWA-total}}
++P_{\text{C4-state}}
++P_{\text{C128-state}}
+\right)
+\]
+
+### 4.3 对失败日志的精确复现
+
+当 \(L=32768\)，且 \(Q\ge L\)：
 
 ```text
-输入配置 / 启动日志 / 实测边界
-              |
-              v
-      Capacity & Calibration
-              |
-       +------+------+
-       |             |
-       v             v
- Startup Model   Runtime Model
-       |             |
-       +------+------+
-              v
-       Search & Validation
-              |
-              v
- 双口径推荐、分解、余量、可信度
+C4 history        64 pages
+C128 history       2 pages
+SWA              514 pages
+C4 state        4097 pages
+C128 state      1025 pages
+合计            5702 pages
 ```
 
-建议模块：
+\[
+5702\times22\times147712
+=17.2570199966\ \text{GiB}
+\]
 
-- `capacity.py`：名义 HBM、可见 HBM、启动空闲 HBM和规划预算；
-- `startup.py`：profile、最低 KV、Graph 三阶段启动模型；
-- `runtime.py`：真实 workload 下的稳态和瞬态峰值模型；
-- `calibration.py`：日志解析、组件覆盖、样本拟合和适用范围；
-- `validation.py`：成功/失败区间、交叉验证和误差报告；
-- `engine.py`：只负责组合结果，不再内嵌各阶段公式；
-- `recommender.py`：分别搜索启动极限和运行安全 frontier。
+日志显示 17.26 GiB，理论误差小于 0.01 GiB。因此这部分不需要经验拟合。
 
-## 6. 容量口径
+### 4.4 现有代码的三项根因
 
-平台容量分为三个字段：
+现有代码得到约 24.11 GiB，主要因为：
 
-```json
-{
-  "platform": {
-    "nominal_hbm_gib_per_die": 64.0,
-    "visible_hbm_gib_per_die": 61.27,
-    "startup_free_hbm_gib_per_die": 60.89,
-    "gpu_memory_utilization": 0.9
-  }
-}
+1. C4/C128 state 按 Q 直接计算，没有使用 `min(state_window + Q, max_model_len)` 截断；
+2. 用物理 pool 分配路径的 23 个 allocation tuple 代替最低准入检查的
+   22 个 tuple；
+3. 模型 profile 中的 sliding window 写成 4096，官方配置和源码实际为 128。
+
+其中第 1 项在 `Q > max_model_len` 时造成最大误差。修复后应以源码公式为唯一事实来源。
+
+### 4.5 需要拆开的三个 KV 数值
+
+输出不得再混用：
+
+- `required_min_kv_bytes`：启动时至少容纳一个最大长度请求的源码检查值；
+- `allocated_kv_pool_bytes`：available memory 经 block/page 取整后实际创建的池；
+- `runtime_live_kv_bytes`：真实请求和并发场景使用的逻辑 live KV/state。
+
+## 5. 权重：从“总参数除并行度”改为逐张量理论模型
+
+### 5.1 现有公式的问题
+
+现有解析公式：
+
+```text
+routed experts / EP
+其余全部 / TP
+所有权重统一按 8 bit
+最后乘固定 3% overhead
 ```
 
-优先级：
+对本场景得到约 19.95 GiB，日志为 27.17 GiB。差距不是单纯的“权重 overhead”，而是建模分类错误：
 
-1. 启动日志解析的数值；
-2. 用户显式填写的 `visible_hbm_gib_per_die` 和 `startup_free_hbm_gib_per_die`；
-3. 平台/版本 profile 的默认值；
-4. 名义 HBM。
+1. W8A8 checkpoint 中仍有大量 BF16/FP32 张量；
+2. `ReplicatedLinear` 不除 TP；
+3. Column/Row Parallel 张量才按 TP 切分；
+4. routed experts 按实际 EP group 和 local expert mapping 切分；
+5. `enable_shared_expert_dp=true` 会改变 shared expert 的权重放置；
+6. W8A8 dynamic 额外保存 weight scale、offset 和部分 FP32 scale 副本；
+7. `model_memory_usage` 包含模型构造期间创建的持久 buffer，不只是 checkpoint payload；
+8. MTP 有独立权重、embedding/head 和持久状态。
 
-若只能使用名义 HBM，结果必须标记容量未经实测，并降低可信度。
+### 5.2 模型元数据事实
 
-启动 KV 规划预算为：
+公开 W8A8 MTP checkpoint 的 index 声明：
+
+```text
+total_size = 300002377534 bytes = 279.399 GiB
+70 个 safetensors shard
+103176 个 tensor 名称
+```
+
+量化描述明确区分：
+
+- routed/shared expert 的 W1/W2/W3：`W8A8_DYNAMIC`；
+- WQ_A/WQ_B/WKV：`W8A8_DYNAMIC`；
+- WO_A/WO_B：FLOAT；
+- compressor WKV/WGate：FLOAT；
+- indexer 的部分投影：W8A8，部分为 FLOAT；
+- router、norm、mHC、embedding、head 和 MTP 中存在 BF16/FP32 张量。
+
+因此，`total_parameters × 1 byte` 不是该模型的权重 HBM。
+
+### 5.3 新的逐张量计算路径
+
+优先读取：
+
+```text
+config.json
+quant_model_description.json
+*.safetensors header
+model.safetensors.index.json 或 quant_model_weights.safetensors.index.json
+```
+
+对每个目标 rank，执行：
+
+```text
+checkpoint tensor
+  -> vLLM 参数名映射
+  -> 模块类型
+  -> checkpoint dtype/shape
+  -> load 后 dtype/shape
+  -> TP/EP/PP/local-expert placement
+  -> post-load transform/duplicate
+  -> 本 rank 持久字节
+```
+
+必须显式支持：
+
+- `ReplicatedLinear`；
+- `ColumnParallelLinear`；
+- `RowParallelLinear`；
+- `VocabParallelEmbedding`；
+- `ParallelLMHead`；
+- `FusedMoE` local experts；
+- shared expert DP；
+- MTP draft layer；
+- W8A8 dynamic scale/offset；
+- `weight_scale_fp32` 等 post-load 副本；
+- PP 首尾 stage 的 embedding/head 放置。
+
+### 5.4 模型加载内存分解
+
+日志中的 `weights` 改名解释为 `model_load_persistent`，并拆成：
 
 \[
-M_{\text{requested}}
-=U\times M_{\text{visible-HBM}}
+M_{\text{model-load}}
+=M_{\text{loaded-tensors}}
++M_{\text{post-load-duplicates}}
++M_{\text{model-owned-buffers}}(Q,S)
++M_{\text{allocator-residual}}
 \]
 
-物理 OOM 检查使用：
+DeepSeek-V4-Flash MTP 中可理论计算的 Q 相关持久 buffer 至少包括：
 
 \[
-M_{\text{startup-free-HBM}}
+M_{\text{mtp-hidden}}
+=Q\times(hc\_mult\times hidden\_size)\times dtype\_bytes
 \]
 
-两者不可混用。
+当 \(Q=45056\)、`hc_mult=4`、`hidden_size=4096`、BF16：
 
-## 7. 启动极限模型
+\[
+M_{\text{mtp-hidden}}=1.375\ \text{GiB}
+\]
 
-### 7.1 阶段 A：profile 与最低 KV 检查
+target 和 MTP 各有一个 indexer top-k buffer：
+
+\[
+M_{\text{topk-buffers}}
+=2\times Q\times index\_topk\times4
+\]
+
+当 `index_topk=512`：
+
+\[
+M_{\text{topk-buffers}}\approx0.172\ \text{GiB}
+\]
+
+这些内存在 vLLM 的 MemoryProfiler 中计入 model load，不能放进普通 activation。
+
+### 5.5 当前理论复核进展
+
+仅用公开配置、量化描述和 v0.23.0rc1 模块定义，已经可将 DP8/TP2、Q=45056 的模型加载内存从旧公式约 19.95 GiB 修正到约 25.9 GiB。
+
+与日志 27.17 GiB 的剩余差额约 1.25 GiB，当前标记为待解释残差，不能直接设为校准常数。实现阶段继续通过：
+
+- safetensors header 的精确 dtype/shape；
+- post-load 参数和 buffer 清单；
+- ACL format padding；
+- shared expert overlap 的持久 buffer；
+- allocator reserved/allocated 差异；
+
+逐项闭合。只有确实无法静态确定的剩余项才进入版本化 reserve。
+
+## 6. 激活、non-Torch 和 Graph
+
+### 6.1 Profile activation
+
+激活继续采用结构化算子峰值模型。当前成功点理论约 7.20 GiB，日志 7.27 GiB，说明主项方向正确。
+
+实现时仍需：
+
+- 按 profile dummy-run 的 token 分配规则生成 shape；
+- 区分 target 与 MTP；
+- 区分相加的持久 buffer 和时间复用的临时 tensor；
+- 使用峰值 live-set，而不是把所有层的 activation 简单求和。
+
+### 6.2 non-Torch
+
+non-Torch 3.08 GiB 不能默认为零，也不能全部回归到 Q：
+
+- HCCL buffer；
+- CANN/ACL context；
+- 算子 workspace；
+- 通信域和 stream；
+- `HCCL_BUFFSIZE=1024`；
+- FlashComm1 和 multistream。
+
+其中能由配置确定的 buffer 先解析计算；其余按“平台 + CANN + HCCL + 并行配置 + 运行开关”建立测量 profile。
+
+### 6.3 Graph
+
+`FULL_DECODE_ONLY` 的 Graph memory 在 KV pool 规划后产生，单独用于启动阶段 C 的物理 OOM 检查，不回填最低 KV 检查。
+
+## 7. 启动极限计算流程
+
+对每个候选 `(Q,S)`：
+
+### 阶段 A：profile 后可用 KV
 
 \[
 M_{\text{available-KV}}(Q,S)
 =M_{\text{requested}}
--M_{\text{weight}}
--M_{\text{profile-activation}}(Q,S,TP,EP)
--M_{\text{non-Torch}}(Q,S,TP,EP)
+-M_{\text{model-load}}(Q,S)
+-M_{\text{profile-activation}}(Q,S)
+-M_{\text{non-Torch}}(Q,S)
 \]
 
-必须满足：
+### 阶段 B：最低 KV 检查
 
 \[
-M_{\text{required-min-KV}}(L,Q,S,\text{layout})
+M_{\text{required-min-KV}}(L,Q,\text{layout})
 \le M_{\text{available-KV}}(Q,S)
 \]
 
-DeepSeek-V4 的最低 KV 需求仍可能通过 hybrid cache spec 间接受 Q 影响，因此不能简单视为
-仅与 L 有关。该计算由版本化 KV adapter 提供，profile dummy run 的 Q 分配与最低 KV planner
-是两个不同概念。
+### 阶段 C：KV pool 分配
 
-失败结果应包含：
+按指定版本源码的 group、page、block rounding 和 worker-min 规则计算实际 pool tensor。
 
-- `limiting_stage="minimum_kv_check"`；
-- 可用 KV、最低需求和缺口；
-- 使用的组件来源：解析、日志或校准。
-
-### 7.2 阶段 B：KV BlockPool 物理分配
-
-检查分组、page padding、block rounding 和 worker 间最小 block 数后形成的实际 pool tensor 是否能
-完成分配。该阶段区分：
-
-- planner 最低需求；
-- requested KV budget；
-- 实际分配的 pool tensor；
-- 因异构分组和取整导致的超额分配。
-
-### 7.3 阶段 C：Decode 图捕获
-
-图缓存独立检查：
+### 阶段 D：Graph 捕获
 
 \[
-M_{\text{post-KV-live}}
-+M_{\text{decode-graph}}(S,TP,MTP)
+M_{\text{post-KV-live}}+M_{\text{decode-graph}}
 \le M_{\text{startup-free-HBM}}
 \]
 
-`FULL_DECODE_ONLY` 只建模 Decode capture sizes。MTP 的 `enforce_eager=true` 不等价于整个服务
-禁用图模式。
-
-### 7.4 启动输出
-
-```json
-{
-  "startup_limit": {
-    "max_num_batched_tokens": 45056,
-    "max_num_seqs": 64,
-    "limiting_stage": "minimum_kv_check",
-    "requested_memory_gib": 55.14,
-    "available_kv_gib": 17.62,
-    "required_min_kv_gib": 17.26,
-    "headroom_gib": 0.36,
-    "confidence": "measured"
-  }
-}
-```
-
-数值仅示意字段结构；最终值由候选搜索和取整规则产生。
+输出第一个失败阶段，不用一个总 HBM 数值代替生命周期判断。
 
 ## 8. 运行安全模型
 
-运行模型不以“服务能启动”为成功标准。它按 workload 场景计算：
+运行时按 workload 场景计算：
 
 \[
 M_{\text{runtime-peak}}
-=M_{\text{weight}}
-+M_{\text{physical-KV-pool}}
-+M_{\text{live-KV/state}}
-+M_{\text{prefill/decode-activation}}
-+M_{\text{operator-workspace}}
+=M_{\text{model-load}}
++M_{\text{allocated-KV-pool}}
++M_{\text{runtime-live-state}}
++M_{\text{activation-live-set}}
++M_{\text{workspace}}
 +M_{\text{graph}}
-+M_{\text{runtime}}
-+M_{\text{fragmentation}}
++M_{\text{runtime-reserve}}
 \]
 
-场景至少包括：
+至少覆盖：
 
-- 新请求大 Prefill；
-- 长上下文续 Prefill；
-- 高并发 Decode；
-- MTP Decode；
+- fresh prefill；
+- late prefill；
+- high-concurrency decode；
+- MTP decode；
 - 用户指定的上下文长度分布。
 
-安全推荐必须满足用户配置的最小物理余量和不确定组件 reserve。运行推荐不得高于启动极限。
+运行安全推荐需要物理 HBM 余量和未知项 reserve。
 
-### 8.1 运行输出
+## 9. 校准边界
 
-```json
-{
-  "runtime_safe": {
-    "max_num_batched_tokens": 32768,
-    "max_num_seqs": 32,
-    "estimated_peak_hbm_gib": 56.1,
-    "physical_headroom_gib": 4.79,
-    "binding_scenario": "late_prefill",
-    "confidence": "analytical_with_partial_calibration"
-  }
-}
-```
+日志的作用限定为：
 
-## 9. 校准模型
+1. 验证理论分项是否与 vLLM 日志口径一致；
+2. 标出未解释残差；
+3. 为无法静态确定的 non-Torch/workspace/graph 建立版本化测量项；
+4. 验证预测临界点是否落在实测区间。
 
-### 9.1 日志解析
+禁止：
 
-解析以下稳定字段：
+- 用一个总修正系数同时修正权重和 KV；
+- 在源码公式已经可精确复现时继续拟合 KV；
+- 把成功/失败九组数据全部用于拟合后，再把同一批数据报告为独立验证；
+- 用实测权重直接覆盖错误的理论权重分类而不报告根因。
 
-- visible/free HBM；
-- desired utilization 和 requested memory；
-- weights；
-- peak activation；
-- non-Torch；
-- NPU graph；
-- current KV cache；
-- minimum required KV 和 available KV；
--失败阶段及 traceback 类型。
+## 10. 九组边界验证
 
-原始日志值和解析值都进入输出，避免无声覆盖。
-
-### 9.2 校准作用域
-
-校准键至少包含：
-
-```text
-device
-vllm_ascend_version
-model_profile
-quantization
-TP / EP / PP / PCP / DCP
-graph_mode
-relevant additional-config flags
-```
-
-校准值不得跨不兼容作用域复用。
-
-### 9.3 缺失数据
-
-- 有日志：使用实测组件；
-- 有多个 Q 样本：拟合 profile activation/non-Torch 的分段线性或单调插值；
-- 只有一个样本：校准截距，斜率保留解析模型并扩大不确定性；
-- 没有日志：使用解析模型和保守上界。
-
-不允许静默使用零值表示未知 Workspace。
-
-## 10. 推荐搜索
-
-搜索过程对每个 `(Q,S)` 产生两个判断：
-
-```text
-startup_feasible
-runtime_safe
-```
-
-约束关系：
-
-```text
-runtime_safe => startup_feasible
-```
-
-推荐结果包括：
-
-- 启动 frontier；
-- 运行安全 frontier；
-- 固定 S 时最大 Q；
-- 固定 Q 时最大 S；
-- 每个失败候选的第一限制阶段；
-- 统一配置与分场景配置。
-
-## 11. 实测验证
-
-边界样本格式：
-
-```json
-{
-  "max_model_len": 32768,
-  "dp_size": 8,
-  "tp_size": 2,
-  "max_num_seqs": 64,
-  "max_success_mnbt": 45056,
-  "first_fail_mnbt": 47104
-}
-```
-
-真实临界点位于：
+每组真实临界点为：
 
 \[
-Q^* \in [Q_{\text{success}},Q_{\text{fail}})
+Q^*\in[Q_{\text{success}},Q_{\text{fail}})
 \]
 
-验证规则：
+验收规则：
 
-1. 预测最大成功 Q 落入该区间则通过；
-2. 报告与区间两端的距离，不伪造单点误差；
-3. 组件日志样本用于组件校准；
-4. 其余上下文或并行组合用于留出验证；
-5. 补充 leave-one-context-length-out 结果，防止只记住三个长度。
+1. 理论预测的最大成功 Q 落入区间；
+2. 报告距离区间上下界的 token 数；
+3. 报告限制阶段；
+4. 报告理论分项和未解释残差；
+5. 先完成零拟合的九点验证；
+6. 若必须引入 measured profile，采用留一法验证，不能污染保留样本。
 
-当前 9 组数据全部固定 `S=64`，因此：
+当前九组均固定 `S=64`，只能验证 Q 的启动边界，不能验证 S 的缩放或运行安全并发。
 
-- 可验证 Q 的启动边界；
-- 不能实证验证 S 的缩放；
-- 不能实证验证真实请求运行安全值。
+## 11. 代码结构
 
-对未验证维度必须显示 `extrapolated` 或较低可信度。
+计划新增或重构：
 
-## 12. 兼容与迁移
-
-现有 schema v2 继续接受：
-
-```json
-"hbm_gib_per_die": 64.0
+```text
+src/vllm_ascend_hbm/
+  capacity.py
+  startup.py
+  runtime.py
+  validation.py
+  logs.py
+  weights/
+    manifest.py
+    placement.py
+    modelslim_w8a8.py
+    persistent_buffers.py
+  kv/
+    deepseek_v4_flash_v020.py
+    deepseek_v4_flash_v023.py
 ```
 
-加载时迁移为 `nominal_hbm_gib_per_die`。现有 `operation=estimate/recommend` 保留，并增加明确口径：
+原则：
 
-```json
-{
-  "operation": "recommend",
-  "recommendation": {
-    "outputs": ["startup_limit", "runtime_safe"]
-  }
-}
-```
+- `engine.py` 只组合，不内嵌版本公式；
+- KV adapter 逐版本复现上游源码；
+- 权重 adapter 使用张量 manifest 和 placement rule；
+- 实测 profile 独立存放，不修改理论 adapter；
+- 输出同时包含数值、公式来源和适用条件。
 
-旧配置默认输出双口径，并在文本结果中解释差异。
+## 12. 测试优先顺序
 
-## 13. 测试策略
+实施前先写失败测试：
 
-测试必须先于生产代码修改：
+1. `L=32768,Q=47104` 的最低 KV 必须为约 17.25702 GiB；
+2. Q 超过 L 后，state pages 必须因 `min(...,L)` 进入平台期；
+3. 最低 KV 检查必须使用 22 tuple，物理 pool 分配路径单独验证 23
+   allocation tuple；
+4. sliding window 必须来自 config，当前模型为 128；
+5. C4 主/indexer state 同组取最大值；
+6. replicated/TP/EP/shared-expert-DP placement 单元测试；
+7. W8A8 scale、offset、FP32 duplicate 测试；
+8. Q 相关 MTP hidden/top-k buffer 测试；
+9. 45056 成功与 47104 最低 KV 失败日志重建；
+10. 九组区间验证；
+11. 现有其他模型 profile 回归测试。
 
-1. 日志解析单元测试；
-2. visible HBM 与 nominal HBM 不混用测试；
-3. 45056 成功样本的组件重建测试；
-4. 47104 在 minimum KV check 阶段失败测试；
-5. Graph 不参与该 KV 可用量计算的测试；
-6. 运行安全值不超过启动极限的性质测试；
-7. schema v2 兼容测试；
-8. 9 组边界区间验证；
-9. 未校准配置的置信度降级测试；
-10. 现有 DeepSeek、Qwen、manual adapter 回归测试。
+## 13. 本阶段验收标准
 
-## 14. 验收标准
-
-1. 成功日志重建误差：
-   - 权重、激活、non-Torch、Graph：日志输入时精确复现；
-   - available KV：误差不超过 0.05 GiB；
-2. DP8/TP2、32K 的预测边界落入 `[45056,47104)`；
-3. 9 组边界分别报告通过/失败，不隐藏未匹配项；
-4. 运行安全推荐始终不高于启动极限；
-5. 无日志时输出完整解析结果、未知项和可信度；
-6. 全部现有测试继续通过；
-7. README、配置示例和建模文档同步更新。
-
-## 15. 风险与后续数据
-
-主要风险：
-
-- 不同 TP 下权重副本、共享专家 DP 和通信 buffer 差异较大；
-- `HCCL_BUFFSIZE=1024`、FlashComm1 和 CANN 版本会改变 non-Torch；
-- Graph capture sizes 可能随 S、TP、MTP 和版本变化；
-- 当前没有真实请求压测，运行模型只能是解析加保守校准。
-
-为提高 TP1/TP4 精度，后续优先补充每种 TP 一个成功启动 summary。为验证 S，至少固定
-`max_model_len` 和 TP，再测试两个不同 `max_num_seqs`。为验证运行安全值，需要加入实际 Prefill
-和 Decode 压测峰值。
+1. KV 最低需求以源码公式复现，单点误差不超过 0.01 GiB；
+2. 权重不再使用“总参数统一 8 bit 后除 TP/EP”作为精确路径；
+3. 有本地模型目录时输出逐张量精确放置清单；
+4. 无模型目录时使用内置 tensor manifest，并显示版本；
+5. 模型加载内存的未解释残差单独显示，不静默乘 overhead；
+6. 九组边界首先进行无拟合验证；
+7. 双口径输出和失败阶段清晰可解释；
+8. README、配置模板和建模说明同步更新。

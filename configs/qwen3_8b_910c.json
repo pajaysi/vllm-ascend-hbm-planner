@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "operation": "recommend",
+  "platform": {
+    "device": "910c",
+    "vllm_ascend_version": "latest",
+    "hbm_gib_per_die": 64.0,
+    "gpu_memory_utilization": 0.9
+  },
+  "model": {
+    "profile": "qwen3-8b",
+    "model_path": null
+  },
+  "weights": {
+    "dense_weight_bits": 8.0,
+    "routed_expert_weight_bits": 8.0
+  },
+  "kv_cache": {
+    "dtype_bytes": 2,
+    "page_alignment_bytes": 256,
+    "planner_overhead_fraction": 0.0
+  },
+  "scheduler": {
+    "block_size": 128,
+    "max_model_len": 131072,
+    "max_num_batched_tokens": 32768,
+    "max_num_seqs": 64
+  },
+  "parallelism": {
+    "dp_size": 1,
+    "tp_size": 2,
+    "pp_size": 1,
+    "ep_size": 1,
+    "pcp_size": 1,
+    "dcp_size": 1
+  },
+  "workload": {
+    "mode": "late",
+    "context_len": 32768,
+    "concurrency": [1, 2, 4, 8, 16, 32, 64],
+    "concurrency_scope": "per-dp"
+  },
+  "recommendation": {
+    "objective": "balanced",
+    "candidate_max_num_batched_tokens": [1024, 2048, 4096, 8192, 16384, 32768, 65536],
+    "candidate_max_num_seqs": [1, 2, 4, 8, 16, 32, 64],
+    "scenarios": [
+      {"name": "128k_max", "context_len": 131072},
+      {"name": "32k_typical", "context_len": 32768}
+    ]
+  },
+  "output": {"format": "text"}
+}

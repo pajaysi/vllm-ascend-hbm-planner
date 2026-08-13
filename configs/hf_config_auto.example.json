@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "operation": "estimate",
+  "platform": {
+    "device": "910c",
+    "vllm_ascend_version": "latest",
+    "hbm_gib_per_die": 64.0,
+    "gpu_memory_utilization": 0.9
+  },
+  "model": {
+    "profile": "auto",
+    "name": "local-decoder-model",
+    "config_path": "/path/to/model/config.json",
+    "model_path": "/path/to/model",
+    "total_parameters": null
+  },
+  "weights": {
+    "dense_weight_bits": 8.0,
+    "routed_expert_weight_bits": 8.0
+  },
+  "kv_cache": {
+    "dtype_bytes": 2,
+    "page_alignment_bytes": 256,
+    "planner_overhead_fraction": 0.0
+  },
+  "scheduler": {
+    "block_size": 128,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 16
+  },
+  "parallelism": {
+    "dp_size": 1,
+    "tp_size": 4,
+    "pp_size": 1,
+    "ep_size": 1,
+    "pcp_size": 1,
+    "dcp_size": 1
+  },
+  "workload": {
+    "mode": "late",
+    "context_len": 32768,
+    "concurrency": [1, 2, 4, 8, 16],
+    "concurrency_scope": "per-dp"
+  },
+  "output": {"format": "json"}
+}

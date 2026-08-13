@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "operation": "recommend",
+  "platform": {
+    "device": "910c",
+    "vllm_ascend_version": "0.23.0rc1",
+    "hbm_gib_per_die": 64.0,
+    "nominal_hbm_gib_per_die": 64.0,
+    "visible_hbm_gib_per_die": 61.27,
+    "startup_free_hbm_gib_per_die": 60.89,
+    "gpu_memory_utilization": 0.9
+  },
+  "vllm_ascend": {
+    "enable_shared_expert_dp": true,
+    "multistream_overlap_shared_expert": true,
+    "enable_flashcomm1": true,
+    "hccl_buffsize_mib": 1024,
+    "hccl_communication_domains_per_rank": 1
+  },
+  "model": {
+    "profile": "deepseek-v4-flash"
+  },
+  "scheduler": {
+    "block_size": 128,
+    "max_model_len": 524288,
+    "max_num_batched_tokens": 39936,
+    "max_num_seqs": 64
+  },
+  "parallelism": {
+    "dp_size": 4,
+    "tp_size": 4,
+    "pp_size": 1,
+    "ep_size": 16,
+    "pcp_size": 1,
+    "dcp_size": 1
+  },
+  "validation": {
+    "profile_calibration_by_tp": {
+      "1": {
+        "profiled_max_num_batched_tokens": 23552,
+        "weight_gib_per_rank": 31.76,
+        "peak_activation_gib_per_rank": 4.74,
+        "non_torch_gib_per_rank": 2.60,
+        "graph_gib_per_rank": 1.28,
+        "visible_hbm_gib_per_die": 61.28,
+        "startup_free_hbm_gib_per_die": 61.13
+      },
+      "2": {
+        "profiled_max_num_batched_tokens": 45056,
+        "weight_gib_per_rank": 27.17,
+        "peak_activation_gib_per_rank": 7.27,
+        "non_torch_gib_per_rank": 3.08,
+        "graph_gib_per_rank": 1.97,
+        "visible_hbm_gib_per_die": 61.27,
+        "startup_free_hbm_gib_per_die": 60.89
+      },
+      "4": {
+        "profiled_max_num_batched_tokens": 39936,
+        "weight_gib_per_rank": 24.26,
+        "peak_activation_gib_per_rank": 3.38,
+        "non_torch_gib_per_rank": 3.07,
+        "graph_gib_per_rank": 1.80,
+        "visible_hbm_gib_per_die": 61.27,
+        "startup_free_hbm_gib_per_die": 60.89
+      }
+    }
+  },
+  "output": {
+    "format": "text"
+  }
+}
