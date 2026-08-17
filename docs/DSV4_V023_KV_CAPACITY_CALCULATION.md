@@ -1,29 +1,279 @@
-# DeepSeek-V4-Flash 在 vLLM Ascend v0.23 中的 HBM 容量推导
+# DeepSeek-V4-Flash / vLLM Ascend v0.23 HBM 容量建模：从系统预算到 KV 页面
 
-本文说明以下配置下，DeepSeek-V4-Flash 的总 HBM 占用如何从输入参数逐项推导。第 1～12 节先给出 KV/state 的源码等价计算；第 13 节开始继续推导权重、激活、Workspace、HCCL/non-Torch、NPU Graph、运行时缓冲、碎片与安全余量：
+本文不是只回答“一个 token 的 KV 有多大”，而是从**部署推荐系统**的角度回答下面三个逐级收敛的问题：
+
+1. 给定硬件、模型、并行拓扑和 vLLM Ascend 参数，服务能否完成 `vllm serve` 启动？
+2. 即使服务能够启动，Graph 捕获和真实请求运行时是否仍有足够 HBM？
+3. 在满足容量约束的候选中，应推荐怎样的 `max_num_batched_tokens` 和 `max_num_seqs`？
+
+全文采用“系统总览 → 生命周期与总公式 → 组件模型 → DSV4 KV 源码级推导 → 实测校准 → 集群化推荐”的顺序展开。这样既能在前几节建立完整认知，也能继续向下追踪到 page、block、layer tuple 和代码实现。
+
+本文的默认参考场景为：
 
 - 硬件：Ascend 910C / Atlas 800 A3，按逻辑 NPU die 计量；
 - 模型：DeepSeek-V4-Flash W8A8，启用 1 层 MTP；
 - 软件：`vllm-ascend==0.23.0rc1`；
-- 默认示例：`block_size=128`、无 PCP/DCP；
-- 单位：除非特别说明，容量均为每个逻辑 NPU/die；
-- 测试目标：`vllm serve` 能否完成启动，不包含真实请求压测。
+- 默认 KV 布局：`block_size=128`，无 PCP/DCP；
+- 容量单位：除非特别说明，均为每个逻辑 NPU/die；
+- 实测边界：主要观察 `vllm serve` 能否启动，运行安全需要额外的真实请求压测。
 
-KV 部分最重要的结论不是一个固定的“每 token KV 大小”，而是必须区分三种口径：
+## 0. 系统级总览
 
-1. **最低启动准入容量**：vLLM 启动时检查 KV pool 是否至少能容纳一个最大长度请求；
-2. **KV pool 规划/物理容量**：根据 available memory、layer tuple、MTP 和页面取整创建全局 BlockPool；
-3. **运行时 live KV/state 容量**：真实请求、并发、prefill chunk 和上下文切分实际占用的块。
+### 0.1 系统要解决的不是单个公式，而是一条部署决策链
 
-这三个值来自不同的源码路径，不能共用同一个“每 block 字节数”。
+从调度系统看，HBM 推荐不是“把模型参数量除以卡数，再加一份 KV”这么简单。它是一条带有阶段、拓扑和置信度的决策链：
 
-阅读导航：
+```mermaid
+flowchart LR
+    HW["硬件库存<br/>设备、Die、visible HBM、节点数"]
+    CFG["推理配置<br/>模型、量化、L/Q/S、Graph、MTP"]
+    PAR["并行拓扑<br/>DP/TP/PP/EP/PCP/DCP"]
+    CAL["离线校准<br/>weights、activation、non-Torch、Graph"]
 
-- 只关心 KV 页面与 `17.26 GiB` 日志复现：阅读第 1～12 节；
-- 关心 weights 为什么达到 24～32 GiB/rank：阅读第 14 节；
-- 关心 activation、HCCL、Workspace 和 Graph：阅读第 15～19 节；
-- 关心完整总量、重复计费和三份日志闭合：阅读第 20～22 节；
-- 关心 64/128 卡以上的部署推荐与线下校准：阅读第 23～25 节。
+    MODEL["版本化容量模型<br/>权重 + KV + 非 KV + 生命周期"]
+    SEARCH["候选搜索<br/>Q × max_num_seqs"]
+    GATE1{"启动最低准入"}
+    GATE2{"运行安全上界"}
+    OUT["部署推荐<br/>推荐值、极限值、余量、限制组件"]
+
+    HW --> MODEL
+    CFG --> MODEL
+    PAR --> MODEL
+    CAL --> MODEL
+    MODEL --> SEARCH
+    SEARCH --> GATE1
+    GATE1 -->|通过| GATE2
+    GATE1 -->|失败| SEARCH
+    GATE2 -->|通过| OUT
+    GATE2 -->|失败| SEARCH
+```
+
+系统最终输出的不是一个孤立的 Q，而是一个可解释的决策：
+
+- 哪个 `max_num_batched_tokens` 可以启动；
+- 哪个 Q/S 组合适合真实业务；
+- 当前限制来自权重、KV、activation、Graph、Workspace 还是通信；
+- 与下一个失败候选相差多少 HBM；
+- 每个内存组件来自源码公式、模型结构、日志实测还是工程保守项。
+
+### 0.2 三个系统平面
+
+为了避免配置、计算和决策相互混杂，可以把系统拆成三个平面。
+
+| 平面 | 主要职责 | 典型内容 |
+|---|---|---|
+| 输入与资产平面 | 描述客观资源和期望部署 | 硬件 JSON、模型 config、vLLM 参数、并行策略、业务场景 |
+| 容量计算平面 | 生成各阶段、各 rank 的容量需求 | 权重放置、KV adapter、activation、HCCL、Graph、Workspace、校准 profile |
+| 决策平面 | 搜索候选并执行容量门槛 | startup minimum、runtime upper、worker-min、headroom、Q/S frontier |
+
+仓库中的双 JSON 也遵循这个边界：
+
+- 硬件 JSON 保存设备型号、服务器数、逻辑 Die 数和可见 HBM 等稳定事实；
+- 推理 JSON 保存模型、版本、并行拓扑、`gpu_memory_utilization`、L/Q/S 和运行开关；
+- 校准日志或 topology profile 是可选的第三类数据，用于覆盖无法静态确定的非 KV 部分。
+
+`gpu_memory_utilization` 属于部署策略，不是硬件属性；`visible_hbm_gib_per_die` 属于运行环境事实，不应隐藏在模型 profile 中。
+
+### 0.3 必须同时区分三个维度
+
+容量数字只有同时带上**作用范围、生命周期和证据等级**才有意义。
+
+#### 维度一：作用范围
+
+| 范围 | 解释 |
+|---|---|
+| per rank / per logical die | 单个 worker 是否 OOM，是主要容量判断口径 |
+| per DP engine | scheduler 的 Q/S 和本地并发口径 |
+| per PP stage | 权重、层数和 KV tuple 可能不均衡，必须取最重 stage |
+| whole cluster | 资源成本和吞吐能力，不能代替单 rank OOM 判断 |
+
+例如 DP 会复制模型和 KV pool。整机 HBM 会随 DP 增长，但单个请求的 KV 不会因为 DP 增大而缩小。最终 BlockPool 数量还可能由并行组中容量最小的 worker 决定。
+
+#### 维度二：生命周期
+
+| 阶段 | 主要存活对象 | 主要问题 |
+|---|---|---|
+| 模型加载 | 权重、量化元数据、模型持久 buffer | 模型能否加载 |
+| Profile run | 权重、峰值 activation、部分 workspace、non-Torch | 还剩多少 available KV |
+| Minimum admission | available KV 与单个最大请求最低 KV | `serve` 是否被准入检查拒绝 |
+| KV pool 创建 | 全局 BlockPool tensor | 能创建多少 global block |
+| Graph capture | KV pool、模型常驻对象、Graph 内存 | Graph 捕获是否 OOM |
+| 请求运行 | live KV/state、activation、workspace、runtime buffer | 真实业务是否安全 |
+
+不同阶段的峰值对象不一定同时存活。把启动日志中的所有数字直接相加，是最常见的重复计费错误之一。
+
+#### 维度三：证据等级
+
+| 等级 | 示例 | 使用方式 |
+|---|---|---|
+| source-exact | DSV4 v0.23 minimum KV 页面公式 | 直接用于准入边界 |
+| tensor/structure-aware | W8A8 权重放置、通用 activation | 给出中央值和不确定性 |
+| measured | non-Torch、Graph、kernel Workspace | 按 topology signature 校准 |
+| engineering reserve | 碎片、未知 Workspace、安全余量 | 只作为显式保守项 |
+
+理论和校准不是二选一。正确关系是：理论模型负责可解释的结构，实测数据只覆盖无法静态确定的残差。
+
+### 0.4 启动生命周期和三道容量门槛
+
+系统级计算按时间顺序执行，而不是只做一次总和。
+
+```mermaid
+flowchart TD
+    A["读取 visible/startup-free HBM"] --> B["加载模型并执行 profile run"]
+    B --> C["计算 available KV"]
+    C --> D{"Gate A<br/>minimum KV <= available KV"}
+    D -->|失败| X["serve 启动失败"]
+    D -->|通过| E["按 planner tuple 创建 KV pool"]
+    E --> F["捕获 NPU Graph"]
+    F --> G{"Gate B<br/>post-KV live + Graph <= physical HBM"}
+    G -->|失败| Y["Graph 阶段 OOM"]
+    G -->|通过| H["进入请求运行"]
+    H --> I{"Gate C<br/>runtime planning upper + headroom <= budget"}
+    I -->|失败| Z["能启动但不建议上线"]
+    I -->|通过| J["运行安全候选"]
+```
+
+#### Gate A：启动最低准入
+
+首先定义 vLLM 目标预算：
+
+$$
+M_{requested}=M_{visible}\times U
+$$
+
+Profile 后可供 KV 使用的容量：
+
+$$
+M_{availableKV}
+=M_{requested}
+-M_{model-load}
+-M_{profile-activation}
+-M_{nonTorch}
+$$
+
+启动最低准入条件：
+
+$$
+M_{minKV}(L,Q,B)\le M_{availableKV}
+$$
+
+这道门只回答：KV pool 是否至少能容纳一个 `max_model_len` 请求所需的最低页面。
+
+#### Gate B：KV pool 与 Graph 的物理阶段
+
+通过准入后，planner 用 available KV 反推 global block 数：
+
+$$
+N_{blocks}
+=\left\lfloor
+\frac{M_{availableKV}}
+{S_{planner/block}}
+\right\rfloor
+$$
+
+实际创建的 KV tensor 为：
+
+$$
+M_{KV-physical}
+=N_{blocks}\times S_{physical/block}
+$$
+
+Graph 在 KV pool 之后捕获，所以需要单独验证当时仍存活的物理对象，而不能在 `available KV` 中提前扣一次、之后再重复加一次。
+
+#### Gate C：运行安全上界
+
+运行期中央值：
+
+$$
+\begin{aligned}
+M_{runtime-central}
+=&M_{model-load}
++M_{KV-physical}
++M_{activation-live}\\
+&+M_{workspace-peak}
++M_{graph}
++M_{runtime-persistent}\\
+&+M_{fragmentation}
++M_{safety}
+\end{aligned}
+$$
+
+容量规划时把物理 KV 替换为更保守的 planner 口径：
+
+$$
+M_{runtime-planning}
+=M_{runtime-central}
+-M_{KV-physical}
++M_{KV-planner}
+$$
+
+线上推荐通常使用上界而不是中央值：
+
+$$
+M_{planning-upper}
++M_{unresolved-workspace-reserve}
++M_{minimum-headroom}
+\le M_{requested}
+$$
+
+因此，**启动成功是必要条件，不是运行安全的充分条件**。
+
+### 0.5 总 HBM 的组件树
+
+从所有权看，单 rank HBM 可以拆为以下组件：
+
+```text
+HBM / logical rank
+├─ Model load
+│  ├─ checkpoint tensors / quantization metadata
+│  ├─ TP/EP/PP placement residual
+│  └─ MTP、RoPE、top-k 等模型持久 buffer
+├─ KV subsystem
+│  ├─ minimum admission KV
+│  ├─ planner BlockPool
+│  ├─ physical KV tensors
+│  └─ runtime live KV/state
+├─ Compute live set
+│  ├─ profile/runtime activation
+│  └─ operator workspace
+├─ Runtime infrastructure
+│  ├─ HCCL/CANN/non-Torch
+│  ├─ NPU Graph
+│  └─ input、block table、sampler metadata
+└─ Risk allowance
+   ├─ allocator fragmentation
+   ├─ component uncertainty
+   └─ safety/headroom reserve
+```
+
+这些组件不能一律按相同方式建模：
+
+- KV 页面和 safetensors payload 可以接近确定性计算；
+- 权重 rank placement 与 activation 依赖模型结构和并行拓扑；
+- CANN、Graph、Workspace 和通信域需要版本化实测；
+- 碎片和安全余量应作为独立、可见、可调整的工程项。
+
+### 0.6 KV 子系统的三个不同答案
+
+即使只看 KV，也不存在唯一的“KV 容量”：
+
+1. **最低启动准入容量**：vLLM 是否允许服务继续初始化；
+2. **KV pool 规划/物理容量**：available memory 最终生成多少 BlockPool tensor；
+3. **运行时 live KV/state 容量**：给定请求长度、并发和 chunk 后实际占用多少块。
+
+三者来自不同源码路径，使用不同的每 global block 等价字节数。本文后续将具体解释为什么同一场景可能同时出现 `49.0 GiB`、`51.0 GiB` 和 `51.3 GiB`，而它们都不是计算错误。
+
+### 0.7 分级阅读路线
+
+后文按三层展开：
+
+- **确定性内核层（第 1～12 节）**：从 DSV4 cache 类型、page 和 layer tuple 推导 minimum/planner/physical/live KV；
+- **完整单 rank 容量层（第 13～22 节）**：推导权重、activation、Workspace、通信、Graph、runtime 和总 HBM 生命周期；
+- **集群与产品化层（第 23～26 节）**：解释多种并行策略、64/128 卡以上 topology signature、离线校准和线上推荐输出。
+
+如果只需要快速判断系统结论，可以先阅读本节和文末第 27 节；如果需要复现日志中的 `17.26 GiB`，继续阅读第 1～8 节；如果需要实现部署推荐器，则应完整阅读第 13～25 节。
+
+> **展开层级一：下面先进入 DSV4 KV 的确定性内核。** 这一层解释最容易被误解、同时又最能由源码精确确定的 page、block 和 layer tuple。
 
 ## 1. 输入参数和符号
 
@@ -546,6 +796,8 @@ python -c "from vllm_ascend_hbm.kv.deepseek_v4_v023 import minimum_kv_admission 
 只满足第一条，意味着 `serve` 可能启动；同时满足第二条，才适合推荐为线上运行参数。
 
 ---
+
+> **展开层级二：从 KV 内核扩展到完整单 rank HBM。** 第 13～22 节按启动生命周期依次加入权重、activation、通信、Workspace、Graph、运行时缓冲和风险余量，并明确哪些对象不能同时计费。
 
 ## 13. 总 HBM 模型与启动生命周期
 
@@ -1713,6 +1965,10 @@ weights + peak activation + non-Torch + current KV + Graph
 
 与 `requested` 直接比较，因为 peak activation 是 profile 阶段瞬时峰值，并不与完整 KV pool 和 Graph 全部同时存活。Graph 阶段应使用 post-KV live snapshot 或 Graph 捕获前后的真实 free-memory 差分。
 
+---
+
+> **展开层级三：从单 rank 公式扩展到集群和部署推荐。** 第 23～26 节把组件模型放入 DP/TP/PP/EP/PCP/DCP 拓扑，说明如何通过离线校准支持 64/128 卡以上部署，而不要求线上调用者提供完整 rank 映射。
+
 ## 23. 不同并行策略和大规模集群
 
 ### 23.1 DP
@@ -1929,3 +2185,183 @@ python vllm_ascend_hbm_calculator.py `
   --config configs\deepseek_v4_flash_910c_v023_topology_profiled.json `
   --validate-boundaries configs\dsv4_v023_startup_boundaries.json
 ```
+
+---
+
+## 27. 总结：从容量数字到部署决策
+
+### 27.1 系统级结论
+
+DeepSeek-V4-Flash 的 HBM 需求不是一个静态常数，而是下面五类变量共同作用的结果：
+
+```text
+硬件可见容量
++ 模型和量化布局
++ 并行拓扑
++ vLLM Ascend 调度/Graph/通信参数
++ 业务长度、chunk 和并发
+```
+
+部署推荐系统必须沿真实启动生命周期计算，而不能把所有组件压缩成一个粗略求和式。完整判断至少包含三道门：
+
+1. **模型与 profile 能否留下足够的 available KV；**
+2. **minimum KV、BlockPool 和 Graph 能否完成启动；**
+3. **真实请求的 planning upper 是否仍保留必要 headroom。**
+
+只有第三道门也通过时，候选 Q/S 才适合作为线上推荐。`serve` 启动成功只证明前两阶段没有立即失败。
+
+### 27.2 五个最重要的公式
+
+#### 公式一：vLLM 目标容量
+
+$$
+M_{requested}=M_{visible}\times gpu\_memory\_utilization
+$$
+
+优先使用运行时实际可见 HBM，不使用标称 HBM 直接计算。910C 示例中应使用 $61.27\times0.9$，而不是 $64\times0.9$。
+
+#### 公式二：Profile 后可用 KV
+
+$$
+M_{availableKV}
+=M_{requested}
+-M_{model-load}
+-M_{profile-activation}
+-M_{nonTorch}
+$$
+
+这个结果决定 KV planner 可以使用的预算，也是启动日志中 `Current KV cache memory` 的主要来源。
+
+#### 公式三：DSV4 v0.23 最低 KV
+
+$$
+M_{minKV}
+=P_{total}\times22\times(S_{large}+S_{small})
+$$
+
+其中：
+
+$$
+P_{total}
+=P_{C4H}+P_{C128H}+P_{SWA}+P_{C4S}+P_{C128S}
+$$
+
+`22` 是统一 layer tuple 深度，已经包含层维度，不能再乘 43 或 44。`P_total` 是五类 cache group 的 global block 等价页数，不是 token 数。
+
+#### 公式四：KV BlockPool
+
+$$
+N_{blocks}
+=\left\lfloor
+\frac{M_{availableKV}}
+{S_{planner/block}}
+\right\rfloor
+$$
+
+$$
+M_{KV-physical}
+=N_{blocks}\times S_{physical/block}
+$$
+
+在 `block_size=128`、1 层 MTP 场景中：
+
+```text
+minimum admission / block = 3,249,664 B
+physical tensor / block   = 3,380,736 B
+planner / block           = 3,397,376 B
+```
+
+三种口径服务于不同阶段，不能互换，也不能相加。
+
+#### 公式五：运行安全上界
+
+$$
+M_{planning-upper}
++M_{unresolved-workspace-reserve}
++M_{minimum-headroom}
+\le M_{requested}
+$$
+
+`planning_upper` 应包含权重、planner KV、live activation、Workspace、Graph、runtime、碎片、安全余量和各组件不确定性。
+
+### 27.3 各组件应该如何建模
+
+| 组件 | 首选方法 | 是否需要线下校准 | 主要影响参数 |
+|---|---|---|---|
+| DSV4 minimum KV | v0.23 源码等价页面公式 | 只需边界验证 | L、Q、block size、MTP、PCP/DCP |
+| KV planner/physical | page bucket + layer tuple | 版本/布局变化时验证 | available KV、MTP、PP stage |
+| 权重/model-load | tensor-aware 放置或 safetensors header | TP/EP/PP residual | 模型、量化、TP、EP、PP、Q buffer |
+| Activation | live-set 结构模型 | 建议采集多个 Q/S 点 | Q、S、TP、FlashComm、MoE |
+| HCCL | BUFFSIZE × 通信域数 | 通信域需由调度系统解析 | TP、EP、跨节点边界 |
+| CANN/non-Torch | 无可靠通用闭式公式 | 必须按拓扑采集 | 软件版本、kernel、通信拓扑 |
+| Workspace | kernel query / 峰值重叠图 | 通常需要 | shape、dtype、kernel、stream |
+| NPU Graph | capture 日志 | 必须按 capture 配置采集 | S、capture size、MTP、编译模式 |
+| Runtime metadata | Q/S/L/vocab 结构公式 | 通常不需要 | block table、sampler、input |
+| 碎片与 headroom | 显式工程余量 | 用运行统计调整 | allocator、版本、稳定性目标 |
+
+确定性组件不应被总量拟合系数修改；实测校准应覆盖的是不能由源码和模型结构确定的残差。
+
+### 27.4 本文示例得到的关键事实
+
+1. 对 $L=32768$、$B=128$，当 Q 已超过状态截断边界后，minimum KV 固定为约 `17.257 GiB`。
+2. `Q=45056` 成功而 `Q=47104` 失败，不是 minimum KV 继续增加，而是更大 Q 增加 profile 阶段的非 KV 峰值，使 available KV 从约 `17.63 GiB` 降到约 `17.2 GiB`。
+3. 对 1M 上下文、`Q=81920`，长期压缩历史只占总需求的一部分；大头来自本轮 SWA/compressor state、页面 padding 和统一 tuple 布局。
+4. 同一 1M/Q 场景出现 `49.038 GiB` minimum、`51.016 GiB` physical 和 `51.267 GiB` planner 是正常现象，它们回答三个不同问题。
+5. TP1、TP2、TP4 的 weights、activation、non-Torch 和 Graph 都不是简单的 $1/TP$；拓扑相关组件必须分开建模。
+
+### 27.5 并行和集群规模的最终原则
+
+- **DP** 分散全局请求，但复制模型和 KV pool；
+- **TP** 改变权重、activation 和通信，DSV4 KV page 不直接除以 TP；
+- **EP** 分片 routed expert，同时改变 all-to-all、shared expert 和通信域；
+- **PP** 必须按 stage 层集合重新生成权重和 KV tuple，并取最重 stage；
+- **PCP/DCP** 在页面取整前切分 Q 或历史长度，不能在总字节计算后简单相除；
+- **多节点集群** 应由调度系统解析 rank group、节点边界和通信域，线上推荐 API 不要求用户提交完整 rank mapping。
+
+64/128 卡以上的关键不是给公式再乘一个卡数，而是建立稳定的 `topology_signature → calibration profile` 映射，并对同一 rank class 使用 p95 或最大值，对并行组使用 worker-min 容量。
+
+### 27.6 部署推荐器的最小输出集合
+
+一次可解释的推荐至少应输出：
+
+```text
+recommended_max_num_batched_tokens
+recommended_max_num_seqs
+startup_limit_max_num_batched_tokens
+runtime_safe_max_num_batched_tokens
+requested_hbm_bytes
+available_kv_bytes
+required_min_kv_bytes
+allocated_kv_pool_bytes
+planner_kv_bytes
+planning_upper_bytes
+headroom_bytes
+limiting_stage
+component_sources
+unresolved_components
+```
+
+推荐结果还应明确区分：
+
+- **启动极限**：只保证通过 `vllm serve` 初始化检查；
+- **运行安全值**：计入真实请求 live-set、未知 Workspace、碎片和最低余量；
+- **验证区间**：实测 `max_success` 与 `first_fail` 之间的离散边界，而不是伪造一个绝对精确阈值。
+
+### 27.7 工程落地检查表
+
+在把一个新模型、版本或拓扑加入推荐系统前，应依次确认：
+
+1. 模型 config、量化格式和 MTP/多模态结构是否已经解析；
+2. KV adapter 是否与目标 vLLM Ascend 版本的页面和准入代码一致；
+3. TP/EP/PP 的权重放置是否按 Tensor/层级建模；
+4. 是否采集至少两个 Q、两个 S、两个 L 的代表点；
+5. 是否分别记录 weights、activation、non-Torch、Graph 和 current KV；
+6. 是否区分节点内与跨节点通信域；
+7. 是否使用相邻成功/失败点验证 startup boundary；
+8. 是否用真实请求验证 runtime-safe 推荐，而不是只观察 serve 启动；
+9. 是否在输出中暴露组件来源、残差、不确定性和 headroom；
+10. 版本或 kernel 路径变化后，是否使旧 calibration profile 失效。
+
+最终可以把本文的方法概括为一句话：
+
+> **以版本化源码模型确定 KV 和结构性内存，以拓扑化实测校准非 KV 残差，沿 vLLM 启动生命周期执行多阶段容量门槛，最后在 Q/S 候选中选择既能启动、又具有运行余量的部署参数。**
