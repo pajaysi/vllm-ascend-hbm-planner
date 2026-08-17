@@ -26,6 +26,10 @@ def _parser() -> argparse.ArgumentParser:
         description="Explainable HBM estimator and vLLM Ascend Q/max_num_seqs recommender"
     )
     parser.add_argument("--config", help="JSON configuration")
+    parser.add_argument(
+        "--hardware-config",
+        help="separate hardware inventory JSON configuration",
+    )
     parser.add_argument("--operation", choices=("estimate", "recommend"))
     parser.add_argument("--format", choices=("text", "json", "csv"))
     parser.add_argument("--model-path", help="local model directory/safetensors for exact weight bytes")
@@ -69,7 +73,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _print_models()
         return 0
     try:
-        c = load_config(args.config)
+        c = load_config(args.config, args.hardware_config)
         if args.operation:
             c["operation"] = args.operation
         if args.format:

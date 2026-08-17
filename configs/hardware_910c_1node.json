@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "device": "910c",
+    "server_count": 1,
+    "physical_cards_per_server": 8,
+    "dies_per_card": 2,
+    "logical_devices_per_server": 16,
+    "nominal_hbm_gib_per_die": 64.0,
+    "visible_hbm_gib_per_die": 61.27,
+    "startup_free_hbm_gib_per_die": 60.89
+  }
+}

@@ -64,6 +64,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "visible_hbm_gib_per_die": None,
         "startup_free_hbm_gib_per_die": None,
         "gpu_memory_utilization": 0.90,
+        "server_count": None,
+        "physical_cards_per_server": None,
+        "dies_per_card": None,
+        "logical_devices_per_server": None,
+        "logical_device_count": None,
     },
     "vllm_ascend": {
         "enable_shared_expert_dp": False,
@@ -211,8 +216,49 @@ def _read_user(path: Optional[str]) -> dict[str, Any]:
     return value
 
 
-def load_config(path: Optional[str] = None) -> dict[str, Any]:
+def _read_hardware(path: Optional[str]) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read hardware config {path!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid JSON in {path!r}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError("hardware JSON root must be an object")
+    if value.get("schema_version", 1) != 1:
+        raise ValueError("hardware schema_version must be 1")
+    hardware = value.get("hardware")
+    if not isinstance(hardware, dict):
+        raise ValueError("hardware JSON needs a hardware object")
+    hardware = copy.deepcopy(hardware)
+    if (
+        hardware.get("hbm_gib_per_die") is None
+        and hardware.get("nominal_hbm_gib_per_die") is not None
+    ):
+        hardware["hbm_gib_per_die"] = hardware["nominal_hbm_gib_per_die"]
+    if (
+        hardware.get("server_count") is not None
+        and hardware.get("logical_devices_per_server") is not None
+    ):
+        hardware["logical_device_count"] = (
+            int(hardware["server_count"])
+            * int(hardware["logical_devices_per_server"])
+        )
+    return hardware
+
+
+def load_config(
+    path: Optional[str] = None,
+    hardware_path: Optional[str] = None,
+) -> dict[str, Any]:
     user = _read_user(path)
+    hardware = _read_hardware(hardware_path)
+    if hardware:
+        user.setdefault("platform", {}).update(hardware)
     if path is not None:
         root = Path(path).resolve().parent
         for section, key in (
@@ -327,6 +373,41 @@ def validate_config(c: dict[str, Any]) -> None:
         _positive_int(f"scheduler.{name}", s[name])
     for name, value in par.items():
         _positive_int(f"parallelism.{name}", value)
+    for name in (
+        "server_count",
+        "physical_cards_per_server",
+        "dies_per_card",
+        "logical_devices_per_server",
+    ):
+        if p.get(name) is not None:
+            _positive_int(f"platform.{name}", p[name])
+    if all(
+        p.get(name) is not None
+        for name in (
+            "physical_cards_per_server",
+            "dies_per_card",
+            "logical_devices_per_server",
+        )
+    ):
+        derived_per_server = (
+            p["physical_cards_per_server"] * p["dies_per_card"]
+        )
+        if derived_per_server != p["logical_devices_per_server"]:
+            raise ValueError(
+                "physical_cards_per_server*dies_per_card="
+                f"{derived_per_server} does not match "
+                "logical_devices_per_server="
+                f"{p['logical_devices_per_server']}"
+            )
+    logical_device_count = p.get("logical_device_count")
+    if logical_device_count is not None:
+        _positive_int("platform.logical_device_count", logical_device_count)
+        world_size = par["dp_size"] * par["tp_size"] * par["pp_size"]
+        if world_size > logical_device_count:
+            raise ValueError(
+                f"DP*TP*PP={world_size} exceeds hardware "
+                f"logical_device_count={logical_device_count}"
+            )
     if par["pcp_size"] > par["tp_size"] or par["dcp_size"] > par["tp_size"]:
         raise ValueError("PCP/DCP cannot exceed TP")
     if par["tp_size"] % par["pcp_size"] or par["tp_size"] % par["dcp_size"]:
